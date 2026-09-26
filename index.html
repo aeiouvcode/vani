@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vani — on-device voice typing</title>
+<meta name="description" content="Real-time voice transcription that runs entirely on your device. No account, no cloud, nothing leaves your phone.">
+<meta name="theme-color" content="#f6f1e7">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="wordmark">Vani</div>
+  <div class="topbar-right">
+    <span id="netdot" class="netdot offline" title="Network status"></span>
+    <button id="modelPill" class="pill" type="button">no model</button>
+    <button id="settingsBtn" class="iconbtn" type="button" aria-label="Settings">&#9881;</button>
+  </div>
+</header>
+
+<main id="main">
+  <section id="transcriptView" class="view">
+    <div id="setupPanel" class="setup">
+      <h1>Voice typing that never leaves your device.</h1>
+      <p class="lede">Real-time transcription runs on a speech model downloaded once and stored locally. No account. No cloud. Audio never touches a server.</p>
+      <div class="model-choice">
+        <button class="modelcard" data-model="tiny" type="button">
+          <span class="mc-name">Fast</span>
+          <span class="mc-detail">Moonshine v2 tiny &middot; 43 MB</span>
+          <span class="mc-note">Instant on most phones</span>
+        </button>
+        <button class="modelcard recommended" data-model="base" type="button">
+          <span class="mc-name">Accurate</span>
+          <span class="mc-detail">Moonshine v2 base &middot; 141 MB</span>
+          <span class="mc-note">Best quality &middot; recommended</span>
+        </button>
+      </div>
+      <div id="dlProgress" class="dlprogress hidden">
+        <div class="dlbar"><div id="dlFill" class="dlfill"></div></div>
+        <div id="dlText" class="dltext">Downloading model&hellip;</div>
+      </div>
+    </div>
+
+    <div id="editorWrap" class="editor-wrap hidden">
+      <div id="editor" class="editor" contenteditable="true" spellcheck="false" aria-label="Transcript"></div>
+      <div id="partial" class="partial"></div>
+    </div>
+
+    <div id="micDock" class="mic-dock hidden">
+      <button id="micBtn" class="micbtn" type="button" aria-label="Hold to talk">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3.5"/></svg>
+      </button>
+      <div class="mic-hint">hold to talk</div>
+      <div id="levelBar" class="levelbar"><div id="levelFill"></div></div>
+    </div>
+
+    <div class="dock-actions">
+      <button id="copyBtn" class="textbtn hidden" type="button">Copy</button>
+      <button id="shareBtn" class="textbtn hidden" type="button">Share</button>
+      <button id="clearBtn" class="textbtn hidden" type="button">Clear</button>
+    </div>
+  </section>
+
+  <section id="recordingsView" class="view hidden">
+    <h2 class="viewtitle">Recordings</h2>
+    <div id="recList" class="reclist"></div>
+    <div id="recEmpty" class="empty">Nothing saved yet. Dictation sessions and file transcriptions land here, stored only on this device.</div>
+  </section>
+
+  <section id="filesView" class="view hidden">
+    <h2 class="viewtitle">Transcribe a recording</h2>
+    <p class="lede small">Pick an audio or video file. It is decoded and transcribed entirely on this device.</p>
+    <button id="pickFileBtn" class="bigbtn" type="button">Choose audio file</button>
+    <input id="fileInput" type="file" accept="audio/*,video/*" class="hidden">
+    <div id="fileProgress" class="dlprogress hidden">
+      <div class="dlbar"><div id="fileFill" class="dlfill"></div></div>
+      <div id="fileText" class="dltext"></div>
+    </div>
+    <div id="fileResult" class="editor-wrap hidden">
+      <div id="fileEditor" class="editor" contenteditable="true" spellcheck="false"></div>
+      <div class="dock-actions"><button id="fileCopyBtn" class="textbtn" type="button">Copy</button></div>
+    </div>
+  </section>
+
+  <section id="dictionaryView" class="view hidden">
+    <h2 class="viewtitle">Corrections</h2>
+    <p class="lede small">Teach it once. Names, slang, jargon — replaced automatically every time, stored only here.</p>
+    <div class="dict-add">
+      <input id="dictFrom" type="text" placeholder="heard as" autocomplete="off">
+      <span class="dict-arrow">&rarr;</span>
+      <input id="dictTo" type="text" placeholder="should be" autocomplete="off">
+      <button id="dictAddBtn" class="textbtn" type="button">Add</button>
+    </div>
+    <div id="dictList" class="dictlist"></div>
+    <h3 class="viewtitle small">Cleanup</h3>
+    <label class="switch-row"><input id="fillerToggle" type="checkbox"> <span>Remove fillers (&ldquo;um&rdquo;, &ldquo;uh&rdquo;, repeated words)</span></label>
+    <label class="switch-row"><input id="denoiseToggle" type="checkbox" checked> <span>Noise reduction in loud environments</span></label>
+  </section>
+
+  <section id="benchView" class="view hidden">
+    <h2 class="viewtitle">Device bench</h2>
+    <p class="lede small">Measures transcription speed on this device with a fixed 5.3s reference clip. Honest numbers, your hardware.</p>
+    <button id="benchBtn" class="bigbtn" type="button">Run bench</button>
+    <div id="benchOut" class="benchout"></div>
+  </section>
+</main>
+
+<nav class="tabbar">
+  <button class="tab active" data-view="transcriptView" type="button">Talk</button>
+  <button class="tab" data-view="recordingsView" type="button">Recordings</button>
+  <button class="tab" data-view="filesView" type="button">File</button>
+  <button class="tab" data-view="dictionaryView" type="button">Corrections</button>
+  <button class="tab" data-view="benchView" type="button">Bench</button>
+</nav>
+
+<div id="settingsSheet" class="sheet hidden">
+  <div class="sheet-card">
+    <h3>Engine</h3>
+    <div id="engineInfo" class="engineinfo"></div>
+    <button id="switchModelBtn" class="textbtn" type="button">Switch model</button>
+    <h3>Privacy</h3>
+    <p class="lede small">Speech models: Moonshine v2 (moonshine-ai, MIT). Denoise: GTCRN. VAD: Silero. All inference runs in this browser via WebAssembly. Recordings and corrections stay in local storage. Network is used only to download models from Hugging Face, once, then the app works offline.</p>
+    <button id="wipeBtn" class="textbtn danger" type="button">Delete all local data</button>
+    <button id="closeSettings" class="bigbtn" type="button">Done</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="js/engine-bundle.js"></script>
+<script src="js/store.js"></script>
+<script src="js/dictionary.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
