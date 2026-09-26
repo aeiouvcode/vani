@@ -1,5 +1,5 @@
 /* Vani service worker: cache-first app shell. Models cache in IndexedDB, not here. */
-const CACHE = 'vani-v3';
+const CACHE = 'vani-v4';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'js/app.js', 'js/store.js', 'js/dictionary.js',
   'js/engine-bundle.js', 'assets/icon.svg', 'assets/bench.wav',
