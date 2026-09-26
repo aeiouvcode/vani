@@ -2699,8 +2699,11 @@ function idbOpen() {
   if (__idb) return Promise.resolve(__idb);
   return new Promise((res) => {
     try {
-      const r = indexedDB.open('vani-models', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('files');
+      const r = indexedDB.open('vani-models', 2);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains('files')) db.createObjectStore('files');
+      };
       r.onsuccess = () => { __idb = r.result; res(__idb); };
       r.onerror = () => { __idbFail = true; res(null); };
     } catch (e) { __idbFail = true; res(null); }
