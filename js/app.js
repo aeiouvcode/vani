@@ -21,7 +21,7 @@ const els = {
 };
 
 let worker = null;
-let modelId = localStorage.getItem('vani-model') || null;
+let modelId = localStorage.getItem('vani-model') || 'tiny';
 let engineReady = false;
 let capturing = false;
 let sessionSegments = [];  // {text, t}
@@ -287,16 +287,39 @@ async function startEngine() {
 /* ---- mic capture ---- */
 let audioCtx = null, mediaStream = null, workletNode = null, downsample = null;
 
+function showMicPanel(errName) {
+  const p = $('micPanel'); if (!p) return;
+  p.classList.remove('hidden');
+  const help = $('micHelp');
+  if (errName === 'NotAllowedError' || errName === 'SecurityError') {
+    help.textContent = 'Chrome blocked the mic for this site. Tap the lock/tune icon left of the address bar, open Permissions, set Microphone to Allow, then tap Enable microphone.';
+  } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+    help.textContent = 'No microphone was found on this device.';
+  } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
+    help.textContent = 'The mic is busy - close other apps that might be using it (calls, camera, voice recorder), then tap Enable microphone.';
+  } else {
+    help.textContent = 'The microphone did not start (' + (errName || 'unknown error') + '). Tap Enable microphone to try again.';
+  }
+}
+function hideMicPanel() { const p = $('micPanel'); if (p) p.classList.add('hidden'); }
+
 async function startCapture() {
   if (!engineReady || capturing) return;
+  // getUserMedia must be reached directly from the press gesture - no awaits first.
+  // Plain audio:true first: some Androids reject channelCount/noise-suppression picks.
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: true },
-    });
-  } catch (e) {
-    toast('Microphone permission needed — check the browser prompt / address bar');
-    return;
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e1) {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: true },
+      });
+    } catch (e2) {
+      showMicPanel((e2 && e2.name) || (e1 && e1.name));
+      return;
+    }
   }
+  hideMicPanel();
   capturing = true;
   sessionSegments = [];
   els.micBtn.classList.add('active');
@@ -377,6 +400,8 @@ els.shareBtn.addEventListener('click', async () => {
   if (navigator.share) { try { await navigator.share({ text: t }); } catch (e) {} }
   else { await navigator.clipboard.writeText(t); toast('Copied (sharing not available)'); }
 });
+const micEnableBtn = $('micEnableBtn');
+if (micEnableBtn) micEnableBtn.addEventListener('click', () => startCapture());
 els.clearBtn.addEventListener('click', () => { els.editor.textContent = ''; els.partial.textContent = ''; });
 
 /* ---- file transcription ---- */
@@ -540,7 +565,8 @@ els.wipeBtn.addEventListener('click', async () => {
 });
 
 /* ---- boot ---- */
-if (modelId) startEngine();
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+startEngine();
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }

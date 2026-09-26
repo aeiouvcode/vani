@@ -32,4 +32,4 @@ your own device. Whisper-tiny int8 was benchmarked and eliminated (worse and
 
 Honest grade: engine PASS on clean + moderate noise, PARTIAL on extreme noise.
 App: live dictation, saved recordings, file transcription, correction memory,
-device bench, offline PWA. Public release pending owner ship-go.
+device bench, offline PWA. Live at https://aeiouvcode.github.io/vani/

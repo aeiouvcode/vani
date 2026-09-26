@@ -48,7 +48,14 @@
       <div id="partial" class="partial"></div>
     </div>
 
-    <div id="micDock" class="mic-dock hidden">
+    <div id="micPanel" class="hidden">
+  <div class="micpanel-inner">
+    <strong>Microphone is off</strong>
+    <p id="micHelp">Tap Enable microphone and accept Chrome's prompt.</p>
+    <button id="micEnableBtn" type="button">Enable microphone</button>
+  </div>
+</div>
+<div id="micDock" class="mic-dock hidden">
       <button id="micBtn" class="micbtn" type="button" aria-label="Hold to talk">
         <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3.5"/></svg>
       </button>

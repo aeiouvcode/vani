@@ -2879,7 +2879,7 @@ function liveFeed(chunk) {
       finishSegment(seg.samples);
       inSpeech = false; speechChunks = []; speechLen = 0;
     }
-    if (inSpeech && speechLen > 8000 && performance.now() - lastPartialAt > 700) {
+    if (inSpeech && speechLen > 4800 && performance.now() - lastPartialAt > 400) {
       lastPartialAt = performance.now();
       const pcm = concat(speechChunks, speechLen);
       const t0 = performance.now();
