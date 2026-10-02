@@ -2,10 +2,25 @@
 'use strict';
 const VaniDict = (() => {
   const KEY = 'vani-dictionary';
-  function load() {
-    try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { return []; }
+  function diagWarn(what, err) {
+    if (typeof VaniDiag !== 'undefined') VaniDiag.warn(what, err);
+    else (console.warn || console.log).call(console, '[vani] ' + what + ' — ' + ((err && err.message) || err));
   }
-  function save(list) { try { localStorage.setItem(KEY, JSON.stringify(list)); } catch (e) {} }
+  function load() {
+    let raw = null;
+    try { raw = localStorage.getItem(KEY); } catch (e) { diagWarn('corrections dictionary is unreadable (storage blocked)', e); return []; }
+    if (raw == null) return [];
+    try { return JSON.parse(raw) || []; }
+    catch (e) {
+      // corrupt stored JSON: keep the app running, but make the data loss visible
+      diagWarn('corrections dictionary was corrupt and has been reset (' + raw.length + ' chars lost)', e);
+      return [];
+    }
+  }
+  function save(list) {
+    try { localStorage.setItem(KEY, JSON.stringify(list)); }
+    catch (e) { diagWarn('corrections dictionary could not be saved', e); }
+  }
   function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
   function apply(text) {
     let out = text;
@@ -31,3 +46,5 @@ const VaniDict = (() => {
   }
   return { load, add, remove, apply, cleanup };
 })();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = VaniDict;

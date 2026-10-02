@@ -3,7 +3,22 @@
 'use strict';
 const VaniStore = (() => {
   const DB = 'vani', STORE = 'recordings';
-  let idb = null, idbFailed = false, mem = [], memNextId = 1;
+  let idb = null, idbFailed = false, mem = [], memNextId = 1, degradedNotified = false;
+  const api = {
+    /* Fired once when IDB is unavailable and the store drops to session-only
+       memory. The app toasts this; silence here meant recordings quietly
+       vanished on reload. */
+    onDegraded: null,
+    lastError: null,
+  };
+  function degrade(err) {
+    idbFailed = true;
+    api.lastError = err || null;
+    if (!degradedNotified) {
+      degradedNotified = true;
+      if (typeof api.onDegraded === 'function') api.onDegraded('IndexedDB open failed');
+    }
+  }
   function useIdb() {
     if (idbFailed) return Promise.resolve(false);
     if (idb) return Promise.resolve(true);
@@ -12,12 +27,11 @@ const VaniStore = (() => {
         const r = indexedDB.open(DB, 1);
         r.onupgradeneeded = () => r.result.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
         r.onsuccess = () => { idb = r.result; res(true); };
-        r.onerror = () => { idbFailed = true; res(false); };
-      } catch (e) { idbFailed = true; res(false); }
+        r.onerror = () => { degrade(r.error); res(false); };
+      } catch (e) { degrade(e); res(false); }
     });
   }
-  return {
-    get persistent() { return !idbFailed; },
+  const methods = {
     async saveRecording(rec) { // {name, created, duration, audio:ArrayBuffer(wav), transcript, segments}
       if (await useIdb()) {
         return new Promise((res, rej) => {
@@ -83,6 +97,10 @@ const VaniStore = (() => {
       mem = [];
     },
   };
+  Object.assign(api, methods);
+  // a getter inside Object.assign would be frozen to its first value
+  Object.defineProperty(api, 'persistent', { get: () => !idbFailed, enumerable: true });
+  return api;
 })();
 
 function floatToWav(samples, sampleRate) {
@@ -100,3 +118,5 @@ function floatToWav(samples, sampleRate) {
   }
   return buf;
 }
+
+if (typeof module !== 'undefined' && module.exports) module.exports = { VaniStore, floatToWav };

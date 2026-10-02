@@ -2693,7 +2693,20 @@ const MODELS = {
 };
 const MODEL_FILES = { 'encoder.ort': 'encoder_model.ort', 'decoder.ort': 'decoder_model_merged.ort', 'tokens.txt': 'tokens.txt' };
 
-let __idb = null, __idbFail = false;
+let __idb = null, __idbFail = false, __storageDegradedPosted = false;
+/* post() is declared later in this file (function declaration, hoisted). */
+function noteStorageDegraded(why, err) {
+  if (__storageDegradedPosted) return;
+  __storageDegradedPosted = true;
+  const detail = why + (err ? ': ' + ((err && err.message) || err) : '');
+  try {
+    post('storage-degraded', { message: detail });
+  } catch (e) {
+    // engine channel not up yet: log it and let the next degradation retry the post
+    __storageDegradedPosted = false;
+    if (typeof console !== 'undefined' && console.warn) console.warn('[vani] storage degraded before engine channel was ready: ' + detail);
+  }
+}
 function idbOpen() {
   if (__idbFail) return Promise.resolve(null);
   if (__idb) return Promise.resolve(__idb);
@@ -2705,8 +2718,8 @@ function idbOpen() {
         if (!db.objectStoreNames.contains('files')) db.createObjectStore('files');
       };
       r.onsuccess = () => { __idb = r.result; res(__idb); };
-      r.onerror = () => { __idbFail = true; res(null); };
-    } catch (e) { __idbFail = true; res(null); }
+      r.onerror = () => { __idbFail = true; noteStorageDegraded('model cache unavailable', r.error); res(null); };
+    } catch (e) { __idbFail = true; noteStorageDegraded('model cache unavailable', e); res(null); }
   });
 }
 async function idbGet(key) {
@@ -2716,8 +2729,8 @@ async function idbGet(key) {
     try {
       const rq = d.transaction('files').objectStore('files').get(key);
       rq.onsuccess = () => res(rq.result || null);
-      rq.onerror = () => res(null);
-    } catch (e) { res(null); }
+      rq.onerror = () => { noteStorageDegraded('model cache read failed', rq.error); res(null); };
+    } catch (e) { noteStorageDegraded('model cache read failed', e); res(null); }
   });
 }
 async function idbPut(key, buf) {
@@ -2727,8 +2740,8 @@ async function idbPut(key, buf) {
     try {
       const rq = d.transaction('files', 'readwrite').objectStore('files').put(buf, key);
       rq.onsuccess = () => res();
-      rq.onerror = () => res();
-    } catch (e) { res(); }
+      rq.onerror = () => { noteStorageDegraded('model cache write failed — the big model will re-download next launch', rq.error); res(); };
+    } catch (e) { noteStorageDegraded('model cache write failed — the big model will re-download next launch', e); res(); }
   });
 }
 async function download(url, onPct) {
@@ -2757,9 +2770,12 @@ const RUNNERS = { asr: __vani_run_asr, vad: __vani_run_vad, se: __vani_run_se };
 const WASM_NAME = { asr: 'sherpa-onnx-wasm-main-asr.wasm', vad: 'sherpa-onnx-wasm-main-vad.wasm', se: 'sherpa-onnx-wasm-main-speech-enhancement.wasm' };
 
 let asrModule = null, vadModule = null, seModule = null;
-let recognizer = null, vad = null, denoiser = null;
+let vad = null, denoiser = null;
+/* Both recognizers may stay resident: the draft model decodes interactively
+   while the accurate model verifies finals in the background (refine). */
+const recognizers = { tiny: null, base: null };
 let currentModel = null;
-let useDenoise = true;
+let useDenoise = false;
 const VAD_WIN = 512;
 
 function post(type, data, transfer) {
@@ -2784,11 +2800,19 @@ function fsWrite(Module, path, bytes) {
   Module.FS.writeFile(path, bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
 }
 
+const modelLoads = {};  // modelId -> in-flight load promise (dedupes concurrent init/enable)
 async function ensureAsr(modelId) {
-  if (recognizer && currentModel === modelId) return;
-  const spec = MODELS[modelId] || MODELS.tiny;
+  const spec = MODELS[modelId];
+  if (!spec) throw new Error('unknown model id ' + JSON.stringify(modelId) + ' (expected one of: ' + Object.keys(MODELS).join(', ') + ')');
   if (!asrModule) asrModule = await loadWasmModule('asr');
-  if (recognizer) { recognizer.free(); recognizer = null; }
+  if (recognizers[modelId]) { currentModel = modelId; return; }
+  // a second caller while the first load is in flight joins it instead of
+  // double-downloading and double-writing the same FS files (tab OOM class)
+  if (modelLoads[modelId]) { await modelLoads[modelId]; currentModel = modelId; return; }
+  modelLoads[modelId] = (async () => {
+  // per-model FS dir: tiny and base stay loaded side by side for refine
+  const dir = '/mdl-' + modelId;
+  if (!asrModule.FS.analyzePath(dir).exists) asrModule.FS.mkdir(dir);
   for (const [local, remote] of Object.entries(MODEL_FILES)) {
     let buf = __BYTES[spec.assetPrefix + remote] || null;
     if (!buf) buf = await idbGet(modelId + '/' + remote);
@@ -2796,44 +2820,154 @@ async function ensureAsr(modelId) {
       buf = await download(spec.baseUrl + remote, p => post('model-progress', { modelId, file: local, pct: p }));
     }
     if (!buf) throw new Error('missing model asset ' + remote);
-    fsWrite(asrModule, '/' + local, buf);
+    fsWrite(asrModule, dir + '/' + local, buf);
     post('model-progress', { modelId, file: local, pct: 1 });
     if (spec.baseUrl) await idbPut(modelId + '/' + remote, buf);  // cache for next launch
     delete __BYTES[spec.assetPrefix + remote];  // let the JS copy be collected
     buf = null;
   }
-  recognizer = new self.VaniAsrGlue.OfflineRecognizer({
+  recognizers[modelId] = new self.VaniAsrGlue.OfflineRecognizer({
     featConfig: { sampleRate: 16000, featureDim: 80 },
     modelConfig: {
-      moonshine: { preprocessor: '', encoder: './encoder.ort', uncachedDecoder: '', cachedDecoder: '', mergedDecoder: './decoder.ort' },
-      tokens: './tokens.txt', numThreads: 1, provider: 'cpu', debug: 0,
+      moonshine: { preprocessor: '', encoder: dir + '/encoder.ort', uncachedDecoder: '', cachedDecoder: '', mergedDecoder: dir + '/decoder.ort' },
+      tokens: dir + '/tokens.txt', numThreads: 1, provider: 'cpu', debug: 0,
     },
   }, asrModule);
   currentModel = modelId;
+  // without refine only the active model stays resident
+  if (!refineWanted) freeModel(modelId === 'tiny' ? 'base' : 'tiny');
+  })();
+  try { await modelLoads[modelId]; } finally { delete modelLoads[modelId]; }
+}
+function freeModel(modelId) {
+  if (recognizers[modelId]) { recognizers[modelId].free(); recognizers[modelId] = null; }
+}
+
+/* ---- speculative refine: draft fast, verify slow ----
+   Tiny drafts every final instantly; when refine is on, base re-decodes the
+   same segment in the background and the app swaps the text in. The
+   llama.cpp speculative-decoding pattern mapped to ASR. Refine never runs
+   while the mic is live: the engine shares the UI thread, so a base decode
+   mid-dictation would stall the words coming out. */
+let refineWanted = false;
+let refineReady = false;
+let refineLoading = false;
+let refineEpoch = 0; // an OFF click invalidates a pending async ON completion
+let refineDegradedPosted = false;
+let segSeq = 0;
+const refineQueue = [];
+let refineRunning = false;
+
+async function setRefine(on) {
+  if (!on) {
+    ++refineEpoch;
+    refineWanted = false;
+    refineQueue.length = 0;
+    refineReady = false;
+    // If the download is still running, its completion will free base.
+    if (!modelLoads.base) freeModel('base');
+    post('refine-state', { on: false });
+    return;
+  }
+  // Duplicate ready-resume and toggle change must join the same load.
+  if (refineWanted && (refineReady || refineLoading)) return;
+  const epoch = ++refineEpoch;
+  refineWanted = true;
+  post('refine-state', { on: true, status: 'loading' });
+  refineLoading = true;
+  try {
+    const keep = currentModel;
+    await ensureAsr('base');
+    // A toggle-off during the 141 MB download wins. Never resurrect an
+    // unwanted model or post a stale "ready" after OFF.
+    if (epoch !== refineEpoch || !refineWanted) {
+      if (!modelLoads.base) freeModel('base');
+      return;
+    }
+    currentModel = keep;
+    refineReady = true;
+    refineDegradedPosted = false;
+    post('refine-state', { on: true, status: 'ready' });
+    pumpRefine();
+  } catch (e) {
+    if (epoch === refineEpoch && refineWanted) {
+      refineReady = false;
+      refineWanted = false;
+      post('refine-state', { on: false, status: 'unavailable', message: (e && e.message) || String(e) });
+    }
+  } finally {
+    if (epoch === refineEpoch) refineLoading = false;
+  }
+}
+
+function pumpRefine() {
+  if (refineRunning || !refineReady || !refineQueue.length) return;
+  if (liveActive || liveIntent) return;  // never steal the thread mid-dictation
+  refineRunning = true;
+  (async () => {
+    while (refineQueue.length && refineReady && !liveActive && !liveIntent) {
+      const job = refineQueue.shift();
+      await new Promise((r) => setTimeout(r, 0));  // let the UI breathe between decodes
+      try {
+        const text = decodeWith('base', job.samples);
+        if (text) post('final-refined', { segId: job.segId, text });
+      } catch (e) {
+        if (!refineDegradedPosted) {
+          refineDegradedPosted = true;
+          post('refine-state', { on: true, status: 'error', message: (e && e.message) || String(e) });
+        }
+      }
+      post('refine-status', { pending: refineQueue.length });
+    }
+    refineRunning = false;
+  })();
 }
 
 async function ensureVad() {
   if (vad) return;
   if (!vadModule) vadModule = await loadWasmModule('vad');
   vad = self.VaniVadGlue.createVad(vadModule, {
-    sileroVad: { model: './silero_vad.onnx', threshold: 0.5, minSpeechDuration: 0.25, minSilenceDuration: 0.55, maxSpeechDuration: 20, windowSize: VAD_WIN },
+    sileroVad: { model: './silero_vad.onnx', threshold: 0.5, minSpeechDuration: 0.25, minSilenceDuration: 0.55, maxSpeechDuration: 8, windowSize: VAD_WIN }, // 8s: wasm decode aborts past ~10s in one segment (measured); stay well under
     sampleRate: 16000, numThreads: 1, provider: 'cpu', debug: 0,
   });
 }
 
-async function ensureDenoiser() {
-  if (denoiser) return;
-  if (!seModule) seModule = await loadWasmModule('se');
-  denoiser = self.VaniSeGlue.createOfflineSpeechDenoiser(seModule, {
-    model: { gtcrn: { model: './gtcrn.onnx' }, numThreads: 1, provider: 'cpu', debug: 0 },
-  });
+let denoiserPromise = null;
+let denoiseWanted = false;
+let seWarmTimer = null;
+/* The inline engine shares the UI thread: compiling the 12MB SE wasm while
+   the user is mid-first-dictation stalls live partials for seconds (measured
+   in the latency lab). Warm it only when the mic is idle. */
+function scheduleDenoiseWarm() {
+  if (!denoiseWanted || denoiser || denoiserPromise) return;
+  clearTimeout(seWarmTimer);
+  seWarmTimer = setTimeout(() => {
+    if (liveActive || liveIntent) { scheduleDenoiseWarm(); return; } // retry after this dictation
+    ensureDenoiser()
+      .then(() => { if (denoiseWanted) { useDenoise = true; post('denoise-ready', {}); post('denoise-state', { on: true, status: 'ready' }); } })
+      .catch((e) => { useDenoise = false; denoiseWanted = false; post('denoise-unavailable', { message: (e && e.message) || String(e) }); post('denoise-state', { on: false, status: 'unavailable' }); });
+  }, 2000);
+}
+function ensureDenoiser() {
+  if (denoiser) return Promise.resolve();
+  if (denoiserPromise) return denoiserPromise; // background warm and explicit toggle can race
+  denoiserPromise = (async () => {
+    if (!seModule) seModule = await loadWasmModule('se');
+    denoiser = self.VaniSeGlue.createOfflineSpeechDenoiser(seModule, {
+      model: { gtcrn: { model: './gtcrn.onnx' }, numThreads: 1, provider: 'cpu', debug: 0 },
+    });
+  })().catch((e) => { denoiserPromise = null; throw e; });
+  return denoiserPromise;
 }
 
-function asrDecode(samples) {
-  const stream = recognizer.createStream();
+function asrDecode(samples) { return decodeWith(currentModel, samples); }
+function decodeWith(modelId, samples) {
+  const rec = recognizers[modelId];
+  if (!rec) throw new Error('model not loaded: ' + modelId);
+  const stream = rec.createStream();
   stream.acceptWaveform(16000, samples);
-  recognizer.decode(stream);
-  const r = recognizer.getResult(stream);
+  rec.decode(stream);
+  const r = rec.getResult(stream);
   stream.free();
   return (r.text || '').trim();
 }
@@ -2844,15 +2978,42 @@ function denoisePcm(pcm) {
 
 /* ---- live dictation ---- */
 let liveActive = false;
+let liveIntent = false; // mic pressed, audio stack still coming up (app tells us)
+let liveIntentTimer = null;
 let livePending = [];
 let livePendingLen = 0;
-let speechChunks = [];
+/* Grow-once speech buffer avoids O(utterance²) full-array copies on partials. */
+let speechBuf = new Float32Array(16000 * 8);
 let speechLen = 0;
+function speechPush(win) {
+  if (speechLen + win.length > speechBuf.length) {
+    const next = new Float32Array(Math.max(speechBuf.length * 2, speechLen + win.length));
+    next.set(speechBuf.subarray(0, speechLen)); speechBuf = next;
+  }
+  speechBuf.set(win, speechLen); speechLen += win.length;
+}
 let inSpeech = false;
 let lastPartialAt = 0;
 let captureChunks = [];
 let captureLen = 0;
 let liveTiming = { decodeMs: 0, audioMs: 0 };
+let denoiseFails = 0, denoiseDegradedPosted = false;
+/* Denoise failures fall back to raw audio (correct), but silently: after a
+   run of failures the toggle is lying to the user, so say so once. */
+function denoiseOrRaw(pcm) {
+  try {
+    const out = denoisePcm(pcm);
+    denoiseFails = 0;
+    return out;
+  } catch (e) {
+    denoiseFails++;
+    if (!denoiseDegradedPosted && denoiseFails >= 2) {
+      denoiseDegradedPosted = true;
+      post('denoise-degraded', { message: (e && e.message) || String(e) });
+    }
+    return pcm;
+  }
+}
 
 function concat(chunks, len) {
   const out = new Float32Array(len); let o = 0;
@@ -2872,19 +3033,22 @@ function liveFeed(chunk) {
     vad.acceptWaveform(win);
     const detected = vad.isDetected();
     if (detected) {
-      if (!inSpeech) { inSpeech = true; speechChunks = []; speechLen = 0; lastPartialAt = 0; }
-      speechChunks.push(win); speechLen += win.length;
+      if (!inSpeech) { inSpeech = true; speechLen = 0; lastPartialAt = 0; }
+      speechPush(win);
     } else if (inSpeech) {
-      speechChunks.push(win); speechLen += win.length;
+      speechPush(win);
     }
     while (!vad.isEmpty()) {
       const seg = vad.front(); vad.pop();
       finishSegment(seg.samples);
-      inSpeech = false; speechChunks = []; speechLen = 0;
+      inSpeech = false; speechLen = 0;
     }
-    if (inSpeech && speechLen > 4800 && performance.now() - lastPartialAt > 400) {
+    // first partial of an utterance lands at 200ms of speech; steady-state
+    // partials keep the 300ms floor (fewer, more accurate re-decodes)
+    const partialFloor = lastPartialAt === 0 ? 3200 : 4800;
+    if (inSpeech && speechLen > partialFloor && performance.now() - lastPartialAt > 400) {
       lastPartialAt = performance.now();
-      const pcm = concat(speechChunks, speechLen);
+      const pcm = speechBuf.subarray(0, speechLen);
       const t0 = performance.now();
       const text = asrDecode(pcm);
       liveTiming.decodeMs += performance.now() - t0;
@@ -2897,13 +3061,17 @@ function liveFeed(chunk) {
 function finishSegment(samples) {
   if (!samples || samples.length < 3200) return;
   let pcm = samples;
-  if (useDenoise && denoiser) {
-    try { pcm = denoisePcm(pcm); } catch (e) { /* fall back to raw */ }
-  }
+  if (useDenoise && denoiser) pcm = denoiseOrRaw(pcm);
   const t0 = performance.now();
   const text = asrDecode(pcm);
   liveTiming.decodeMs += performance.now() - t0;
-  if (text) post('final', { text, t: captureLen / 16000 });
+  if (!text) return;
+  const segId = ++segSeq;
+  post('final', { text, t: captureLen / 16000, segId });
+  if (refineWanted) {
+    refineQueue.push({ segId, samples: pcm.slice() });  // pcm may view speechBuf: own it
+    pumpRefine();
+  }
 }
 
 function liveStop() {
@@ -2912,7 +3080,7 @@ function liveStop() {
     while (!vad.isEmpty()) { const seg = vad.front(); vad.pop(); finishSegment(seg.samples); }
     vad.reset();
   }
-  inSpeech = false; speechChunks = []; speechLen = 0; livePending = []; livePendingLen = 0;
+  inSpeech = false; speechLen = 0; livePending = []; livePendingLen = 0;
   const audio = concat(captureChunks, captureLen);
   const timing = { decodeMs: Math.round(liveTiming.decodeMs), audioMs: Math.round(liveTiming.audioMs) };
   captureChunks = []; captureLen = 0; liveTiming = { decodeMs: 0, audioMs: 0 };
@@ -2925,31 +3093,75 @@ const __handler = async (ev) => {
   const m = ev.data;
   try {
     switch (m.type) {
-      case 'init':
+      case 'init': {
         if (m.assets) for (const k in m.assets) __BYTES[k] = m.assets[k];
-        await ensureAsr(m.modelId || 'tiny');
-        await ensureVad();
-        if (m.denoise) { try { await ensureDenoiser(); } catch (e) { post('denoise-unavailable', {}); } }
-        post('ready', { modelId: currentModel });
+        // ASR and VAD compile in parallel; the denoiser (a third 12MB wasm)
+        // warms in the background so it never gates ready (H2)
+        // Wait for both branches before reporting failure. Otherwise the
+        // surviving load can post progress after the retry UI has reset, or
+        // overlap a second init when the person retries immediately.
+        const loads = await Promise.allSettled([ensureAsr(m.modelId || 'tiny'), ensureVad()]);
+        const failed = loads.find(result => result.status === 'rejected');
+        if (failed) throw failed.reason;
+        useDenoise = !!m.denoise; // init and persisted UI choice must agree
+        denoiseWanted = useDenoise;
+        post('ready', { modelId: currentModel, denoise: denoiseWanted ? 'warming' : 'off' });
+        scheduleDenoiseWarm();
         break;
-      case 'set-denoise':
-        useDenoise = m.on;
-        if (m.on) await ensureDenoiser();
-        post('denoise-state', { on: useDenoise });
+      }
+      case 'set-denoise': {
+        denoiseWanted = !!m.on;
+        if (!denoiseWanted) {
+          clearTimeout(seWarmTimer);
+          useDenoise = false;
+          post('denoise-state', { on: false, status: 'off' });
+        } else if (liveActive || liveIntent) {
+          // Never claim denoise is active mid-take when the model isn't ready.
+          // The next take can use it once the warm-up completes.
+          if (denoiser) { useDenoise = true; post('denoise-state', { on: true, status: 'ready' }); }
+          else { useDenoise = false; scheduleDenoiseWarm(); post('denoise-state', { on: false, status: 'warming' }); }
+        } else {
+          try {
+            await ensureDenoiser();
+            if (denoiseWanted) { useDenoise = true; post('denoise-ready', {}); post('denoise-state', { on: true, status: 'ready' }); }
+          } catch (e) {
+            useDenoise = false;
+            denoiseWanted = false;
+            post('denoise-unavailable', { message: (e && e.message) || String(e) });
+            post('denoise-state', { on: false, status: 'unavailable' });
+          }
+        }
+        break;
+      }
+      case 'set-refine':
+        await setRefine(m.on);
+        break;
+      case 'live-intent':
+        // the mic button is down but getUserMedia/AudioContext are still
+        // coming up: treat as capturing for warm-scheduling purposes
+        liveIntent = true;
+        clearTimeout(liveIntentTimer);
+        liveIntentTimer = setTimeout(() => { liveIntent = false; }, 10000); // denial path never sends live-start
         break;
       case 'live-start':
         await ensureVad();
+        liveIntent = false;
+        clearTimeout(liveIntentTimer);
         liveActive = true;
         captureChunks = []; captureLen = 0; liveTiming = { decodeMs: 0, audioMs: 0 };
-        inSpeech = false; speechChunks = []; speechLen = 0; livePending = []; livePendingLen = 0;
+        inSpeech = false; speechLen = 0; livePending = []; livePendingLen = 0;
         if (vad) vad.reset();
         break;
       case 'live-chunk':
         if (liveActive) liveFeed(new Float32Array(m.buffer));
         break;
       case 'live-stop': {
+        liveIntent = false;
+        clearTimeout(liveIntentTimer);
         const { audio, timing } = liveStop();
         post('live-stopped', { buffer: audio.buffer, timing }, [audio.buffer]);
+        pumpRefine();  // mic is off: base verifies the drafts now
+        scheduleDenoiseWarm();
         break;
       }
       case 'transcribe-buffer': {
@@ -2969,14 +3181,28 @@ const __handler = async (ev) => {
         vad.reset();
         if (!segs.length && samples.length > 1600) segs = [{ samples, start: 0, end: samples.length }];
         let pieces = [];
+        let lastProgress = 0;
         for (let i = 0; i < segs.length; i++) {
           let pcm = segs[i].samples;
-          if (m.denoise && denoiser) { try { pcm = denoisePcm(pcm); } catch (e) {} }
-          const t0 = performance.now();
-          const text = asrDecode(pcm);
-          const ms = performance.now() - t0;
-          if (text) pieces.push({ text, t0: segs[i].start / 16000, t1: segs[i].end / 16000, ms: Math.round(ms) });
-          post('file-progress', { id, pct: 0.1 + 0.9 * (i + 1) / segs.length, partial: pieces.map(p => p.text).join(' ') });
+          if (m.denoise && denoiser) pcm = denoiseOrRaw(pcm);
+          const segStart = typeof segs[i].start === 'number' ? segs[i].start : 0;
+          // decode aborts in wasm past ~10s of audio in one call (measured):
+          // hard-chunk every segment under that, whatever the VAD emitted
+          const MAXSEG = 16000 * 8;
+          for (let c0 = 0; c0 < pcm.length; c0 += MAXSEG) {
+            const chunk = pcm.subarray(c0, Math.min(c0 + MAXSEG, pcm.length));
+            const t0 = performance.now();
+            const text = asrDecode(chunk);
+            const ms = performance.now() - t0;
+            if (text) {
+              pieces.push({ text, t0: (segStart + c0) / 16000, t1: (segStart + c0 + chunk.length) / 16000, ms: Math.round(ms) });
+            }
+          }
+          const now = performance.now();
+          if (now - lastProgress > 2000 || i === segs.length - 1) {
+            lastProgress = now;
+            post('file-progress', { id, pct: 0.1 + 0.9 * (i + 1) / segs.length, partial: pieces.map(p => p.text).join(' ') });
+          }
         }
         post('file-done', { id, pieces });
         break;
@@ -2996,6 +3222,10 @@ const __handler = async (ev) => {
     post('error', { message: (e && e.message) || String(e), during: m.type });
   }
 };
+
+/* Test seam (used by tests/run.mjs): the IDB degradation path only runs when
+   a model byte is actually missing, so the suite pokes it directly. */
+self.__VANI_ENGINE_TEST = { idbOpen, noteStorageDegraded, getDenoiseState: () => ({ on: useDenoise, wanted: denoiseWanted, ready: !!denoiser }), getRefineState: () => ({ wanted: refineWanted, ready: refineReady, loading: refineLoading, baseResident: !!recognizers.base }) };
 
 if (__chan) __chan.addEventListener('message', (ev) => { if (ev.data && ev.data.__fromEngine) return; __handler(ev); });
 else self.onmessage = (ev) => __handler(ev);

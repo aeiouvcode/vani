@@ -16,13 +16,53 @@ const els = {
   fillerToggle: $('fillerToggle'), denoiseToggle: $('denoiseToggle'),
   benchBtn: $('benchBtn'), benchOut: $('benchOut'),
   settingsSheet: $('settingsSheet'), settingsBtn: $('settingsBtn'), closeSettings: $('closeSettings'),
-  engineInfo: $('engineInfo'), switchModelBtn: $('switchModelBtn'), wipeBtn: $('wipeBtn'),
+  engineInfo: $('engineInfo'), switchModelBtn: $('switchModelBtn'), wipeBtn: $('wipeBtn'), refineToggle: $('refineToggle'),
   toast: $('toast'),
 };
 
 let worker = null;
-let modelId = localStorage.getItem('vani-model') || 'tiny';
+let modelId = null;
+try { modelId = localStorage.getItem('vani-model') || 'tiny'; }
+catch (e) { modelId = 'tiny'; VaniDiag.warn('model choice unreadable (storage blocked)', e); }
+
+/* Latency self-measurement. The two numbers Naksh grades: open -> ready and
+   mic tap -> first word. Measured in-app so his phone reports its own truth;
+   the lab harness (control-vani latency) reads the same object. */
+const latency = {
+  openToReadyMs: null,        // navigation start -> engine ready
+  tapToFirstWordMs: null,     // mic press -> first live partial this session
+  tapToFirstFinalMs: null,
+  _tapAt: null, _firstPartialSeen: false, _firstFinalSeen: false,
+};
+self.__VANI_LATENCY = latency;
+function latencyPersist() {
+  try {
+    localStorage.setItem('vani-latency', JSON.stringify({
+      openToReadyMs: latency.openToReadyMs, tapToFirstWordMs: latency.tapToFirstWordMs,
+      tapToFirstFinalMs: latency.tapToFirstFinalMs, at: Date.now(),
+    }));
+  } catch (e) { VaniDiag.warn('latency numbers could not be stored', e); }
+  renderLatency();
+}
+function renderLatency() {
+  const el = $('latencyOut'); if (!el) return;
+  const fmt = (ms) => ms == null ? 'not measured yet' : (ms / 1000).toFixed(2) + 's';
+  el.textContent =
+    'On this device:\n' +
+    'open → ready: ' + fmt(latency.openToReadyMs) + '\n' +
+    'mic tap → first word: ' + fmt(latency.tapToFirstWordMs) + '\n' +
+    'mic tap → first saved sentence: ' + fmt(latency.tapToFirstFinalMs);
+}
+try {
+  const saved = JSON.parse(localStorage.getItem('vani-latency') || 'null');
+  if (saved) {
+    latency.openToReadyMs = saved.openToReadyMs;
+    latency.tapToFirstWordMs = saved.tapToFirstWordMs;
+    latency.tapToFirstFinalMs = saved.tapToFirstFinalMs;
+  }
+} catch (e) { VaniDiag.warn('stored latency numbers unreadable', e); }
 let engineReady = false;
+let denoiseWarm = false;
 let capturing = false;
 let sessionSegments = [];  // {text, t}
 let fileSeq = 0;
@@ -32,6 +72,18 @@ function toast(msg, ms = 2600) {
   els.toast.classList.remove('hidden');
   clearTimeout(toast._t);
   toast._t = setTimeout(() => els.toast.classList.add('hidden'), ms);
+}
+VaniDiag.onEvent = (entry) => {
+  if (entry.userVisible) toast(entry.what, 4200);
+};
+/* engine-side degraded signals arrive as worker messages */
+function handleEngineDegraded(kind, detail) {
+  if (kind === 'storage-degraded') {
+    toast('Local model cache unavailable — the big model will re-download each launch.', 5200);
+  } else if (kind === 'denoise-degraded') {
+    toast('Noise reduction is failing on this device — using raw audio.', 4200);
+  }
+  VaniDiag.warn('engine: ' + kind, detail || null);
 }
 function updateNet() {
   els.netdot.className = 'netdot ' + (navigator.onLine ? 'online' : 'offline');
@@ -54,11 +106,15 @@ document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () =>
   $(b.dataset.view).classList.remove('hidden');
   if (b.dataset.view === 'recordingsView') renderRecordings();
   if (b.dataset.view === 'dictionaryView') renderDict();
+  if (b.dataset.view === 'benchView') renderLatency();
 }));
 
 /* ---- engine assets: hosted build transfers them from the parent frame;
    local server build fetches them from relative paths ---- */
 let workerAssets = null;
+let shellAssets = null;
+let starting = false;
+let readyHideTimer = null;
 let assetsResolve = null;
 const assetsReady = new Promise(r => { assetsResolve = r; });
 window.addEventListener('message', (ev) => {
@@ -67,58 +123,13 @@ window.addEventListener('message', (ev) => {
     assetsResolve();
   }
 });
-const LOCAL_ASSET_PATHS = {
-  'sherpa-onnx-wasm-main-asr.wasm': 'vendor/asr/sherpa-onnx-wasm-main-asr.wasm',
-  'sherpa-onnx-wasm-main-vad.wasm': 'vendor/vad/sherpa-onnx-wasm-main-vad.wasm',
-  'sherpa-onnx-wasm-main-speech-enhancement.wasm': 'vendor/se/sherpa-onnx-wasm-main-speech-enhancement.wasm',
-  'sherpa-onnx-wasm-main-asr.data': 'vendor/asr/sherpa-onnx-wasm-main-asr.data',
-  'sherpa-onnx-wasm-main-vad.data': 'vendor/vad/sherpa-onnx-wasm-main-vad.data',
-  'sherpa-onnx-wasm-main-speech-enhancement.data': 'vendor/se/sherpa-onnx-wasm-main-speech-enhancement.data',
-};
-const LOCAL_MODEL_FILES = ['encoder_model.ort', 'decoder_model_merged.ort', 'tokens.txt'];
-// GitHub's web upload caps files at 25MB: the tiny decoder ships in parts.
-const SPLIT_PARTS = { 'decoder_model_merged.ort': 2 };
-async function fetchChecked(url) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' for ' + url);
-  return resp.arrayBuffer();
-}
-async function fetchModelFile(dir, f) {
-  if (SPLIT_PARTS[f]) {
-    try {
-      const parts = [];
-      for (let i = 1; i <= SPLIT_PARTS[f]; i++) {
-        parts.push(new Uint8Array(await fetchChecked(dir + f + '.part' + i)));
-      }
-      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-      let o = 0;
-      for (const part of parts) { out.set(part, o); o += part.length; }
-      return out.buffer;
-    } catch (e) {
-      return fetchChecked(dir + f); // host serves the unsplit asset instead
-    }
-  }
-  return fetchChecked(dir + f);
-}
 async function ensureAssets(model) {
   if (workerAssets) return workerAssets;
   if (self.__VANI_ASSETS) { workerAssets = self.__VANI_ASSETS; return workerAssets; }
   if (self.VANI_CFG) { await assetsReady; return workerAssets; }
-  const out = {};
-  for (const [k, p] of Object.entries(LOCAL_ASSET_PATHS)) {
-    out[k] = await fetchChecked(p);
-  }
-  const which = model === 'base' ? 'base' : 'tiny';
-  const dir = 'assets/model/' + which + '/';
-  try {
-    for (const f of LOCAL_MODEL_FILES) out['model/' + which + '/' + f] = await fetchModelFile(dir, f);
-  } catch (e) {
-    // not served from this host (the 141MB base model is not on the static
-    // host): the engine downloads it once from Hugging Face and caches it
-    for (const f of LOCAL_MODEL_FILES) delete out['model/' + which + '/' + f];
-  }
-  workerAssets = out;
-  return out;
+  const assets = await VaniAssets.ensureAssets(model, { shellAssets });
+  shellAssets = Object.fromEntries(Object.entries(assets).filter(([k]) => !k.startsWith('model/')));
+  return assets;
 }
 
 /* ---- worker ---- */
@@ -142,14 +153,10 @@ function ensureWorker() {
     wireWorkerMessages();
     return worker;
   }
-  const cfg = self.VANI_CFG || null;
-  worker = new Worker((cfg && cfg.worker) || 'js/engine-worker.js');
-  worker.onerror = (e) => {
-    els.dlText.textContent = 'Engine failed to start: ' + (e.message || 'unknown error');
-    toast('Engine failed to start — ' + (e.message || 'unknown'), 5000);
-  };
-  wireWorkerMessages();
-  return worker;
+  /* No Worker fallback: the standalone worker entry was never shipped —
+     the hosted build always runs the engine inline. A missing channel is a
+     broken deploy; say so instead of 404ing on a phantom file. */
+  throw new Error('engine bundle not loaded (js/engine-bundle.js missing or blocked)');
 }
 
 function wireWorkerMessages() {
@@ -163,27 +170,57 @@ function wireWorkerMessages() {
         break;
       }
       case 'ready': {
+        setStarting(false);
         engineReady = true;
+        latency.openToReadyMs = Math.round(performance.now()); latencyPersist();
         els.dlText.textContent = 'Model ready.';
-        setTimeout(() => els.dlProgress.classList.add('hidden'), 600);
+        readyHideTimer = setTimeout(() => els.dlProgress.classList.add('hidden'), 600);
         els.setup.classList.add('hidden');
         els.editorWrap.classList.remove('hidden');
         els.micDock.classList.remove('hidden');
         [els.copyBtn, els.shareBtn, els.clearBtn].forEach(b => b.classList.remove('hidden'));
         els.modelPill.textContent = m.modelId === 'base' ? 'accurate' : 'fast';
+        if (els.refineToggle.checked) worker.postMessage({ type: 'set-refine', on: true });
         updateEngineInfo();
         break;
       }
       case 'partial': {
+        if (capturing && !latency._firstPartialSeen && latency._tapAt != null) {
+          latency._firstPartialSeen = true;
+          latency.tapToFirstWordMs = Math.round(performance.now() - latency._tapAt);
+          latencyPersist();
+        }
         els.partial.textContent = m.text;
         break;
       }
       case 'final': {
+        if (capturing && !latency._firstFinalSeen && latency._tapAt != null) {
+          latency._firstFinalSeen = true;
+          latency.tapToFirstFinalMs = Math.round(performance.now() - latency._tapAt);
+          latencyPersist();
+        }
         els.partial.textContent = '';
-        appendToEditor(m.text);
-        sessionSegments.push({ text: m.text, t: m.t });
+        appendToEditor(m.text, m.segId);
+        sessionSegments.push({ text: m.text, t: m.t, segId: m.segId });
         break;
       }
+      case 'final-refined':
+        applyRefined(m.segId, m.text);
+        break;
+      case 'refine-state':
+        refineState = m;
+        if (m.status === 'unavailable' || m.status === 'error') {
+          els.refineToggle.checked = false;
+          try { localStorage.setItem('vani-refine', 'off'); }
+          catch (e) { VaniDiag.warn('refine choice could not be saved', e); }
+          toast('Refine unavailable: ' + (m.message || m.status), 4200);
+        } else if (m.status === 'ready') toast('Accurate refine ready');
+        updateEngineInfo();
+        break;
+      case 'refine-status':
+        refinePending = m.pending || 0;
+        updateEngineInfo();
+        break;
       case 'live-stopped': {
         capturing = false;
         els.micBtn.classList.remove('active');
@@ -223,9 +260,29 @@ function wireWorkerMessages() {
         break;
       }
       case 'denoise-unavailable':
-        toast('Noise reduction unavailable on this device');
+        els.denoiseToggle.checked = false;
+        denoiseWarm = false;
+        try { localStorage.setItem('vani-denoise', 'off'); } catch (e) { VaniDiag.warn('denoise choice could not be saved', e); }
+        updateEngineInfo();
+        toast('Noise reduction unavailable on this device' + (m.message ? ' (' + m.message + ')' : ''));
+        break;
+      case 'denoise-state':
+        denoiseWarm = m.status === 'ready';
+        if (m.status === 'unavailable') els.denoiseToggle.checked = false;
+        updateEngineInfo();
+        break;
+      case 'denoise-ready':
+        denoiseWarm = true;
+        updateEngineInfo();
+        break;
+      case 'storage-degraded':
+        handleEngineDegraded('storage-degraded', m.message);
+        break;
+      case 'denoise-degraded':
+        handleEngineDegraded('denoise-degraded', m.message);
         break;
       case 'error': {
+        if (m.during === 'init') { showStartFailure(m.message); break; }
         toast('Engine error: ' + m.message, 4200);
         els.dlText.textContent = 'Something went wrong. ' + m.message;
         break;
@@ -240,24 +297,64 @@ function postProcess(text) {
   return t;
 }
 
-function appendToEditor(text) {
+/* segId -> {start, end} offsets in the editor text, so a refined final can
+   swap its draft in place. */
+const refineSpans = new Map();
+let refineState = null, refinePending = 0;
+function appendToEditor(text, segId) {
   const t = postProcess(text);
   if (!t) return;
   const cur = els.editor.textContent;
+  const start = cur ? cur.replace(/\s+$/, '').length + 1 : 0;
   els.editor.textContent = cur ? cur.replace(/\s+$/, '') + ' ' + t : t;
+  if (segId != null) refineSpans.set(segId, { start, end: start + t.length });
+}
+function applyRefined(segId, rawText) {
+  const span = refineSpans.get(segId);
+  if (!span) return;  // editor was cleared or the draft was never tracked
+  const t = postProcess(rawText);
+  const cur = els.editor.textContent;
+  els.editor.textContent = cur.slice(0, span.start) + t + cur.slice(span.end);
+  const delta = t.length - (span.end - span.start);
+  span.end += delta;
+  for (const s of refineSpans.values()) {
+    if (s.start > span.start) { s.start += delta; s.end += delta; }
+  }
+  const seg = sessionSegments.find(sg => sg.segId === segId);
+  if (seg) seg.text = rawText;
 }
 
 function updateEngineInfo() {
   els.engineInfo.textContent =
     `Model: Moonshine v2 ${modelId} (English)\n` +
-    `Pipeline: Silero VAD → ${els.denoiseToggle.checked ? 'GTCRN denoise → ' : ''}Moonshine ASR, all WebAssembly, all local.\n` +
+    `Pipeline: Silero VAD → ${els.denoiseToggle.checked ? (denoiseWarm ? 'GTCRN denoise → ' : 'GTCRN denoise (warming up) → ') : ''}Moonshine ASR, all WebAssembly, all local.\n` +
+    (refineState && refineState.on ? 'Refine: ' + (refineState.status === 'ready' ? 'accurate model verifying finals' + (refinePending ? ' (' + refinePending + ' queued)' : '') : refineState.status === 'loading' ? 'accurate model downloading…' : (refineState.status || 'on')) + '\n' : '') +
     (VaniStore.persistent ? 'Stored: recordings & corrections in this browser only.' : 'Storage unavailable here: recordings & corrections last for this session only.');
 }
 
+/* This is guidance, not an unsupported benchmark claim. Browser hints are
+   optional and coarse; they do not measure device performance. Never auto-
+   select a model or override the person's saved choice. */
+function deviceAdvice(nav = navigator) {
+  const ram = nav.deviceMemory == null ? NaN : Number(nav.deviceMemory);
+  const cores = nav.hardwareConcurrency == null ? NaN : Number(nav.hardwareConcurrency);
+  if (Number.isFinite(ram) && ram > 0 && ram <= 4) {
+    return 'Fast is the safer starting point here (' + ram + ' GB browser memory hint). Accurate needs about 141 MB plus engine files and may use more memory. Bench checks decode speed after loading.';
+  }
+  if (Number.isFinite(ram) && ram >= 8 && Number.isFinite(cores) && cores >= 4) {
+    return 'Browser hints report ' + ram + ' GB and ' + cores + ' logical cores. Accurate may fit, but its ~141 MB model plus engine files and speed still need a device test.';
+  }
+  return 'Start with Fast (~43 MB model). Accurate needs a ~141 MB model plus engine files and may be slower; browser device hints are unavailable or inconclusive. Bench checks speed after loading.';
+}
+const advice = $('deviceAdvice');
+if (advice) advice.textContent = deviceAdvice();
+
 /* ---- model choice ---- */
 document.querySelectorAll('.modelcard').forEach(c => c.addEventListener('click', () => {
+  if (starting) return;
   modelId = c.dataset.model;
-  try { localStorage.setItem('vani-model', modelId); } catch (e) {}
+  try { localStorage.setItem('vani-model', modelId); }
+  catch (e) { VaniDiag.warn('could not remember model choice (storage blocked)', e); }
   startEngine();
 }));
 els.modelPill.addEventListener('click', () => { openSettings(); });
@@ -268,19 +365,38 @@ els.switchModelBtn.addEventListener('click', () => {
   els.micDock.classList.add('hidden');
 });
 
-async function startEngine() {
-  if (!modelId) return;
+function setStarting(on) {
+  starting = on;
+  document.querySelectorAll('.modelcard').forEach(c => { c.disabled = on; });
+  els.setup.setAttribute('aria-busy', String(on));
+}
+function showStartFailure(message) {
+  setStarting(false);
+  engineReady = false;
   els.setup.classList.remove('hidden');
   els.dlProgress.classList.remove('hidden');
+  els.dlFill.style.width = '0%';
+  els.dlText.textContent = 'Engine failed to start: ' + message +
+    ' Tap Fast or Accurate again to retry.';
+}
+async function startEngine() {
+  if (!modelId || starting) return;
+  const requestedModel = modelId;
+  clearTimeout(readyHideTimer);
+  setStarting(true);
+  engineReady = false;
+  els.setup.classList.remove('hidden');
+  els.dlProgress.classList.remove('hidden');
+  els.dlFill.style.width = '0%';
   els.dlText.textContent = 'Preparing engine…';
   try {
-    const assets = await ensureAssets(modelId);
+    const assets = await ensureAssets(requestedModel);
     ensureWorker().postMessage(
-      { type: 'init', modelId, denoise: els.denoiseToggle.checked, assets },
+      { type: 'init', modelId: requestedModel, denoise: els.denoiseToggle.checked, assets },
       Object.values(assets),
     );
   } catch (e) {
-    els.dlText.textContent = 'Engine failed to start: ' + ((e && e.message) || e);
+    showStartFailure((e && e.message) || e);
   }
 }
 
@@ -305,6 +421,10 @@ function hideMicPanel() { const p = $('micPanel'); if (p) p.classList.add('hidde
 
 async function startCapture() {
   if (!engineReady || capturing) return;
+  latency._tapAt = performance.now();
+  latency._firstPartialSeen = false;
+  latency._firstFinalSeen = false;
+  if (worker) worker.postMessage({ type: 'live-intent' }); // hold the denoiser warm-up during audio setup
   // getUserMedia must be reached directly from the press gesture - no awaits first.
   // Plain audio:true first: some Androids reject channelCount/noise-suppression picks.
   try {
@@ -344,6 +464,7 @@ async function startCapture() {
     src.connect(workletNode);
   } catch (e) {
     // hosted Files block worklet module loads: fall back to ScriptProcessor
+    VaniDiag.warn('audio worklet unavailable, using ScriptProcessor (higher latency)', e);
     const sp = audioCtx.createScriptProcessor(4096, 1, 1);
     sp.onaudioprocess = (ev) => handleChunk(ev.inputBuffer.getChannelData(0));
     src.connect(sp);
@@ -378,10 +499,16 @@ async function onCaptureDone(wavBuffer16k, timing) {
   const samples = new Float32Array(wavBuffer16k);
   const wav = floatToWav(samples, 16000);
   const name = 'Dictation ' + new Date().toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  await VaniStore.saveRecording({
-    name, created: Date.now(), duration: samples.length / 16000,
-    audio: wav, transcript: text, segments: sessionSegments,
-  });
+  try {
+    await VaniStore.saveRecording({
+      name, created: Date.now(), duration: samples.length / 16000,
+      audio: wav, transcript: text, segments: sessionSegments,
+    });
+  } catch (e) {
+    VaniDiag.warn('recording could not be saved', e, { userVisible: true });
+    toast('Could not save the recording — copy your transcript now, it is not stored.', 5000);
+    return;
+  }
   if (timing && timing.audioMs > 0) {
     const rtf = timing.decodeMs / timing.audioMs;
     toast(`Saved. Engine ran at ${rtf.toFixed(2)}× real time on this device.`);
@@ -397,12 +524,19 @@ els.copyBtn.addEventListener('click', async () => {
 });
 els.shareBtn.addEventListener('click', async () => {
   const t = els.editor.textContent;
-  if (navigator.share) { try { await navigator.share({ text: t }); } catch (e) {} }
-  else { await navigator.clipboard.writeText(t); toast('Copied (sharing not available)'); }
+  if (navigator.share) {
+    try { await navigator.share({ text: t }); return; }
+    catch (e) {
+      if (e && e.name === 'AbortError') return; // user cancelled the share sheet: nothing went wrong
+      VaniDiag.warn('native share failed, copied instead', e);
+    }
+  }
+  await navigator.clipboard.writeText(t);
+  toast('Copied (sharing not available)');
 });
 const micEnableBtn = $('micEnableBtn');
 if (micEnableBtn) micEnableBtn.addEventListener('click', () => startCapture());
-els.clearBtn.addEventListener('click', () => { els.editor.textContent = ''; els.partial.textContent = ''; });
+els.clearBtn.addEventListener('click', () => { els.editor.textContent = ''; els.partial.textContent = ''; refineSpans.clear(); });
 
 /* ---- file transcription ---- */
 const fileJobs = {};
@@ -444,18 +578,30 @@ els.fileCopyBtn.addEventListener('click', async () => {
 });
 
 async function saveFileRecording(name, wavBuffer, transcript, pieces) {
-  await VaniStore.saveRecording({
+  try {
+    await VaniStore.saveRecording({
     name: 'File: ' + name, created: Date.now(),
     duration: (() => { const d = pieces.length ? pieces[pieces.length - 1].t1 : NaN; return isFinite(d) ? d : (wavBuffer.byteLength - 44) / 2 / 16000; })(),
-    audio: wavBuffer, transcript, segments: pieces,
-  });
+      audio: wavBuffer, transcript, segments: pieces,
+    });
+  } catch (e) {
+    VaniDiag.warn('file transcription could not be saved', e, { userVisible: true });
+    toast('Transcribed, but could not save it — copy it now, it is not stored.', 5000);
+    return;
+  }
   toast('Saved to Recordings');
 }
 
 /* ---- recordings view ---- */
 let playingAudio = null;
 async function renderRecordings() {
-  const list = await VaniStore.listRecordings();
+  let list;
+  try {
+    list = await VaniStore.listRecordings();
+  } catch (e) {
+    VaniDiag.warn('recordings could not be listed', e, { userVisible: true });
+    return;
+  }
   els.recList.innerHTML = '';
   els.recEmpty.classList.toggle('hidden', list.length > 0);
   for (const r of list) {
@@ -519,9 +665,17 @@ els.dictAddBtn.addEventListener('click', () => {
   renderDict();
   toast(`Will always write “${t}” for “${f}”`);
 });
-els.denoiseToggle.checked = localStorage.getItem('vani-denoise') !== 'off';
+els.refineToggle.checked = localStorage.getItem('vani-refine') === 'on';
+els.refineToggle.addEventListener('change', () => {
+  try { localStorage.setItem('vani-refine', els.refineToggle.checked ? 'on' : 'off'); }
+  catch (e) { VaniDiag.warn('refine choice could not be saved', e); }
+  if (worker) worker.postMessage({ type: 'set-refine', on: els.refineToggle.checked });
+});
+els.denoiseToggle.checked = localStorage.getItem('vani-denoise') === 'on';
 els.denoiseToggle.addEventListener('change', () => {
-  localStorage.setItem('vani-denoise', els.denoiseToggle.checked ? 'on' : 'off');
+  try { localStorage.setItem('vani-denoise', els.denoiseToggle.checked ? 'on' : 'off'); }
+  catch (e) { VaniDiag.warn('denoise choice could not be saved', e); }
+  denoiseWarm = els.denoiseToggle.checked && denoiseWarm;
   if (worker) worker.postMessage({ type: 'set-denoise', on: els.denoiseToggle.checked });
   updateEngineInfo();
 });
@@ -554,20 +708,30 @@ els.settingsSheet.addEventListener('click', (e) => { if (e.target === els.settin
 els.wipeBtn.addEventListener('click', async () => {
   await VaniStore.clearAll();
   localStorage.clear();
+  let modelCacheGone = true;
   if (navigator.storage && navigator.storage.getDirectory) {
     try {
       const root = await navigator.storage.getDirectory();
       await root.removeEntry('models', { recursive: true });
-    } catch (e) {}
+    } catch (e) {
+      modelCacheGone = false;
+      VaniDiag.warn('model cache could not be deleted', e);
+    }
   }
-  toast('All local data deleted. Reloading…');
+  toast(modelCacheGone ? 'All local data deleted. Reloading…'
+                       : 'Data deleted, but the downloaded model may remain (browser blocked its removal). Reloading…', 4000);
   setTimeout(() => location.reload(), 900);
 });
 
+/* ---- store degradation: tell the user their recordings are session-only ---- */
+VaniStore.onDegraded = (why) => {
+  VaniDiag.warn('persistent storage unavailable: ' + why, VaniStore.lastError, { userVisible: true });
+};
+
 /* ---- boot ---- */
-if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch((e) => VaniDiag.warn('persistent-storage request failed; the browser may evict local data', e));
 startEngine();
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.register('sw.js').catch((e) => VaniDiag.warn('offline support failed to install (service worker)', e, { userVisible: true }));
 }
 })();

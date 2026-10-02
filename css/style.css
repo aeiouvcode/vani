@@ -63,8 +63,8 @@ main { flex: 1; overflow-y: auto; padding: 0 20px calc(90px + env(safe-area-inse
 .modelcard.recommended { border-color: var(--rust); }
 .mc-name { font-weight: 650; font-size: 1.02rem; }
 .mc-detail { font-size: 0.82rem; color: var(--ink-soft); }
-.mc-note { font-size: 0.78rem; color: var(--rust); }
-.modelcard:not(.recommended) .mc-note { color: var(--ink-soft); }
+.mc-note { font-size: 0.78rem; line-height: 1.35; color: var(--ink-soft); }
+.modelcard.recommended .mc-note { color: var(--rust); }
 
 .dlprogress { margin: 14px 0; }
 .dlbar { height: 4px; background: var(--paper-2); border-radius: 2px; overflow: hidden; }

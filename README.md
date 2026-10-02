@@ -9,7 +9,7 @@ Mic / file → Silero VAD (segmentation) → GTCRN denoise (optional, for loud
 environments) → Moonshine v2 ASR (English, quantized) → transcript.
 
 - ASR: Moonshine v2 (moonshine-ai), via sherpa-onnx WASM (self-built, v1.13.8).
-  tiny = 43 MB, base = 141 MB, downloaded once from Hugging Face, cached in OPFS.
+  tiny model ~43 MB bundled on this host; base model ~141 MB downloads from Hugging Face on demand and is cached in IndexedDB where browser storage works. Engine WASM files add to the transfer. Browser caches can be cleared or evicted, so later visits may download again.
 - VAD: Silero VAD via official sherpa-onnx WASM prebuilt.
 - Denoise: GTCRN (535 KB) via official sherpa-onnx WASM prebuilt.
 - Corrections dictionary + filler cleanup run as local post-processing.
@@ -30,6 +30,22 @@ your own device. Whisper-tiny int8 was benchmarked and eliminated (worse and
 
 ## Status
 
-Honest grade: engine PASS on clean + moderate noise, PARTIAL on extreme noise.
+Honest grade: PARTIAL on clean read speech outside the original LibriSpeech set, FAIL on this small strong-noise pilot. See QA.md for measured clips and limits; real phone accuracy remains unverified.
 App: live dictation, saved recordings, file transcription, correction memory,
 device bench, offline PWA. Live at https://aeiouvcode.github.io/vani/
+
+## Development
+
+Spine: PLAN.md (current plan), STATE.md (where things stand), MISTAKES.md
+(what bit us), QA.md (verification record), FEATURE-MAP.md (feature → code →
+proof).
+
+- Tests: `node tests/run.mjs` — unit + a real engine decode of
+  assets/bench.wav through the actual WASM build in node.
+- Control CLI: `node control-vani.mjs doctor|snapshot|screenshot|wait-settle|interact`
+  (JSON out, `--dry-run` first). `interact` boots the app in headless Chrome,
+  loads the tiny model and runs the bench. Requires system Chrome and
+  `npm install` (puppeteer-core, dev-only).
+- House rules: logic over surface; narrow catches, fail loud (the T5
+  sentinel test rejects empty/comment-only catches); verification claims go
+  through the CLI; bump the sw.js CACHE name with any SHELL change.

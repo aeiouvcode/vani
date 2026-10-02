@@ -1,17 +1,25 @@
 /* Vani service worker: cache-first app shell. Models cache in IndexedDB, not here. */
-const CACHE = 'vani-v4';
+const CACHE = 'vani-v15';
+// Only the app shell precaches. The big binaries (vendor wasm/data, tiny
+// model) used to precache too, which made every first visit download them
+// TWICE: once by this install, once by the page's own engine fetches racing
+// it. Now they flow through the fetch handler's runtime cache on the page's
+// single pull. Same offline state after first use, half the first-visit cost.
 const SHELL = [
   './', 'index.html', 'css/style.css', 'js/app.js', 'js/store.js', 'js/dictionary.js',
-  'js/engine-bundle.js', 'assets/icon.svg', 'assets/bench.wav',
-  'vendor/asr/sherpa-onnx-wasm-main-asr.wasm', 'vendor/asr/sherpa-onnx-wasm-main-asr.data',
-  'vendor/vad/sherpa-onnx-wasm-main-vad.wasm', 'vendor/vad/sherpa-onnx-wasm-main-vad.data',
-  'vendor/se/sherpa-onnx-wasm-main-speech-enhancement.wasm', 'vendor/se/sherpa-onnx-wasm-main-speech-enhancement.data',
+  'js/diag.js', 'js/assets.js',
+  'js/engine-bundle.js', 'js/capture-worklet.js', 'assets/icon.svg', 'assets/bench.wav',
   'manifest.webmanifest',
-  'assets/model/tiny/encoder_model.ort', 'assets/model/tiny/decoder_model_merged.ort.part1',
-  'assets/model/tiny/decoder_model_merged.ort.part2', 'assets/model/tiny/tokens.txt',
 ];
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())
+      .catch((err) => {
+        // without this, offline support dies silently and activate never runs
+        console.error('[vani] offline install failed — a SHELL entry is missing or the network dropped:', err);
+        throw err;
+      })
+  );
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
